@@ -15,6 +15,33 @@ const SHEET_NAME = process.env.SHEET_NAME || '請假紀錄';
 
 const client = new line.Client(config);
 
+// ===== 課表器材偵測 =====
+function detectEquipment(text) {
+  const equipment = [];
+
+  const hasFin = /\bFin\b/i.test(text);
+  const hasBoard = /\bboard\b/i.test(text);
+  const hasPaddle = /\bpaddle\b|\bP\+board\b|\bP \+ board\b/i.test(text);
+  const hasPullBuoy = /\bpull\b/i.test(text);
+
+  if (hasFin) equipment.push('🐸 蛙鞋 (Fin)');
+  if (hasBoard) equipment.push('🏄 浮板 (Board)');
+  if (hasPaddle) equipment.push('🖐️ 划手板 (Paddle)');
+  if (hasPullBuoy && !hasPaddle) equipment.push('🟡 浮球 (Pull Buoy)');
+
+  return equipment;
+}
+
+function isScheduleMessage(text) {
+  // 課表通常包含距離、組數、時間等關鍵字
+  return (
+    /\d+m\s*x\d+/i.test(text) ||
+    /T-\d+:\d+/.test(text) ||
+    /w-up|warm.?up|cool.?down|dryland/i.test(text) ||
+    /kick|pull|swim|dive/i.test(text)
+  );
+}
+
 // ===== 請假關鍵字 =====
 const LEAVE_KEYWORDS = [
   '請假', '缺席', '不來', '無法出席', '不能來', '沒辦法來',
@@ -114,6 +141,16 @@ async function handleEvent(event) {
 
   const text = event.message.text.trim();
   const senderId = event.source.userId;
+
+  // 課表器材提醒
+  if (isScheduleMessage(text)) {
+    const equipment = detectEquipment(text);
+    if (equipment.length > 0) {
+      const replyMsg = `📋 今日課表器材提醒\n\n請準備以下器材：\n${equipment.map(e => `  ${e}`).join('\n')}\n\n祝練習順利！🏊`;
+      return client.replyMessage(event.replyToken, { type: 'text', text: replyMsg });
+    }
+    return null;
+  }
 
   if (!isLeaveMessage(text)) return null;
 
