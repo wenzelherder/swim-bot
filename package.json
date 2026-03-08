@@ -11,7 +11,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "@line/bot-sdk": "^8.5.0",
+   "@line/bot-sdk": "^7.5.2",
     "express": "^4.18.2",
     "googleapis": "^140.0.0"
   },
