@@ -49,8 +49,28 @@ const LEAVE_KEYWORDS = [
   '今天不來', '明天不來', '這週不來', '下週不來',
 ];
 
-// 等待確認的請假（key: userId, value: { userName, date, reason }）
+// 待處理的請假流程（key: userId）
+// value: { userName, date, reason, needsConfirm, step }
+// step: 'awaiting_date' | 'awaiting_reason' | 'awaiting_confirm'
 const pendingConfirmations = new Map();
+
+function nextStep(pending) {
+  if (!pending.date) return 'awaiting_date';
+  if (!pending.reason) return 'awaiting_reason';
+  if (pending.needsConfirm) return 'awaiting_confirm';
+  return 'ready';
+}
+
+function buildStepMessage(pending) {
+  switch (pending.step) {
+    case 'awaiting_date':
+      return '📅 請問請假日期是哪天？\n（例如：3/15、3月15日、今天、明天）';
+    case 'awaiting_reason':
+      return '📝 請問請假原因是什麼？\n（輸入原因，或回覆「略過」跳過）';
+    case 'awaiting_confirm':
+      return `請確認請假資訊是否正確：\n👤 ${pending.userName}\n📅 ${pending.date}\n📝 ${pending.reason === '未說明' ? '原因未說明' : pending.reason}\n\n回覆「是」確認登記，回覆「否」取消。`;
+  }
+}
 
 /**
  * 回傳：
@@ -194,27 +214,61 @@ async function handleEvent(event) {
   const text = event.message.text.trim();
   const senderId = event.source.userId;
 
-  // ===== 處理待確認的請假 =====
+  // ===== 處理進行中的請假流程 =====
   if (pendingConfirmations.has(senderId)) {
     const pending = pendingConfirmations.get(senderId);
-    const reply = text.trim();
 
-    if (/^(是|對|好|確認|要|yes)$/i.test(reply)) {
-      pendingConfirmations.delete(senderId);
-      try {
-        return await recordLeave(event, pending.userName, pending.date, pending.reason);
-      } catch (e) {
-        console.error('處理失敗:', e.message);
-        return client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ 登記失敗，請管理員手動記錄。' });
-      }
-    }
-
-    if (/^(否|不|取消|不要|no)$/i.test(reply)) {
+    // 任何步驟都可以取消
+    if (/^(否|不|取消|不要|no)$/i.test(text)) {
       pendingConfirmations.delete(senderId);
       return client.replyMessage(event.replyToken, { type: 'text', text: '已取消，不登記請假。' });
     }
 
-    // 非是/否的回覆：清除等待狀態，繼續正常處理該訊息
+    if (pending.step === 'awaiting_date') {
+      const parsedDate = extractDate(text);
+      if (parsedDate === '日期未指定') {
+        return client.replyMessage(event.replyToken, {
+          type: 'text',
+          text: '無法辨識日期，請重新輸入。\n（例如：3/15、3月15日、今天、明天）',
+        });
+      }
+      pending.date = parsedDate;
+      pending.step = nextStep(pending);
+      if (pending.step === 'ready') {
+        pendingConfirmations.delete(senderId);
+        try { return await recordLeave(event, pending.userName, pending.date, pending.reason); }
+        catch (e) { return client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ 登記失敗，請管理員手動記錄。' }); }
+      }
+      pendingConfirmations.set(senderId, pending);
+      return client.replyMessage(event.replyToken, { type: 'text', text: buildStepMessage(pending) });
+    }
+
+    if (pending.step === 'awaiting_reason') {
+      pending.reason = /^略過$/.test(text) ? '未說明' : text;
+      pending.step = nextStep(pending);
+      if (pending.step === 'ready') {
+        pendingConfirmations.delete(senderId);
+        try { return await recordLeave(event, pending.userName, pending.date, pending.reason); }
+        catch (e) { return client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ 登記失敗，請管理員手動記錄。' }); }
+      }
+      pendingConfirmations.set(senderId, pending);
+      return client.replyMessage(event.replyToken, { type: 'text', text: buildStepMessage(pending) });
+    }
+
+    if (pending.step === 'awaiting_confirm') {
+      if (/^(是|對|好|確認|要|yes)$/i.test(text)) {
+        pendingConfirmations.delete(senderId);
+        try { return await recordLeave(event, pending.userName, pending.date, pending.reason); }
+        catch (e) { return client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ 登記失敗，請管理員手動記錄。' }); }
+      }
+      // 非是/否，再次提示
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: `請回覆「是」確認登記，或「否」取消。\n\n${buildStepMessage(pending)}`,
+      });
+    }
+
+    // 未知狀態，清除
     pendingConfirmations.delete(senderId);
   }
 
@@ -236,8 +290,16 @@ async function handleEvent(event) {
   const date = extractDate(text);
   const reason = extractReason(text);
 
-  // 明確第一人稱 → 直接登記
-  if (classification === 'direct') {
+  const pending = {
+    userName,
+    date: date !== '日期未指定' ? date : null,
+    reason: reason !== '未說明' ? reason : null,
+    needsConfirm: classification === 'confirm',
+  };
+  pending.step = nextStep(pending);
+
+  // 資料齊全且不需確認 → 直接登記
+  if (pending.step === 'ready') {
     try {
       return await recordLeave(event, userName, date, reason);
     } catch (e) {
@@ -246,11 +308,14 @@ async function handleEvent(event) {
     }
   }
 
-  // 曖昧情況 → 請本人確認
-  pendingConfirmations.set(senderId, { userName, date, reason });
+  // 缺資料或需確認 → 進入多步驟流程
+  pendingConfirmations.set(senderId, pending);
+  const intro = classification === 'confirm'
+    ? `❓ 偵測到請假訊息，${userName} 請確認以下資訊：\n`
+    : '';
   return client.replyMessage(event.replyToken, {
     type: 'text',
-    text: `❓ 偵測到請假訊息\n👤 ${userName}，請問是你本人要請假嗎？\n📅 ${date}\n\n回覆「是」確認登記，回覆「否」取消。`,
+    text: intro + buildStepMessage(pending),
   });
 }
 
