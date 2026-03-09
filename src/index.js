@@ -337,8 +337,19 @@ async function handleEvent(event) {
   if (pendingConfirmations.has(senderId)) {
     const pending = pendingConfirmations.get(senderId);
 
+    // 課表訊息優先跳出流程
+    if (isScheduleMessage(text)) {
+      pendingConfirmations.delete(senderId);
+      const equipment = detectEquipment(text);
+      if (equipment.length > 0) {
+        const replyMsg = `📋 今日課表器材提醒\n\n請準備以下器材：\n${equipment.map(e => `  ${e}`).join('\n')}\n\n祝練習順利！🏊`;
+        return client.replyMessage(event.replyToken, { type: 'text', text: replyMsg });
+      }
+      return null;
+    }
+
     // 任何步驟都可以中止
-    if (/^(否|不|取消|不要|no)$/i.test(text)) {
+    if (/^(否|不|取消|不要|no|算了|沒事|沒事了|停)$/i.test(text)) {
       pendingConfirmations.delete(senderId);
       const msg = pending.type === 'cancel' ? '好的，保留請假紀錄。' : '已取消，不登記請假。';
       return client.replyMessage(event.replyToken, { type: 'text', text: msg });
