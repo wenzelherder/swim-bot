@@ -49,8 +49,32 @@ const LEAVE_KEYWORDS = [
   '今天不來', '明天不來', '這週不來', '下週不來',
 ];
 
-function isLeaveMessage(text) {
-  return LEAVE_KEYWORDS.some(kw => text.includes(kw));
+// 等待確認的請假（key: userId, value: { userName, date, reason }）
+const pendingConfirmations = new Map();
+
+/**
+ * 回傳：
+ *  'none'    - 不是請假（疑問句 or 說別人）
+ *  'direct'  - 確定是本人請假（含「我」）
+ *  'confirm' - 曖昧，需要二次確認
+ */
+function classifyLeaveMessage(text) {
+  if (!LEAVE_KEYWORDS.some(kw => text.includes(kw))) return 'none';
+
+  // 疑問句過濾：含嗎、呢、？ 或英文問號
+  if (/[嗎呢？?]/.test(text)) return 'none';
+
+  const hasFirstPerson = /我|本人/.test(text);
+  const hasOtherPerson = /你|妳|他|她|誰|對方/.test(text);
+
+  // 在說別人且非自己
+  if (hasOtherPerson && !hasFirstPerson) return 'none';
+
+  // 明確第一人稱
+  if (hasFirstPerson) return 'direct';
+
+  // 沒有人稱代詞，曖昧情況
+  return 'confirm';
 }
 
 function extractDate(text) {
@@ -136,13 +160,65 @@ async function ensureSheetHeader() {
   }
 }
 
+function formatTimestamp(now) {
+  return `${now.getFullYear()}/${now.getMonth() + 1}/${now.getDate()} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+}
+
+async function getUserName(event) {
+  try {
+    if (event.source.type === 'group') {
+      const profile = await client.getGroupMemberProfile(event.source.groupId, event.source.userId);
+      return profile.displayName;
+    }
+    const profile = await client.getProfile(event.source.userId);
+    return profile.displayName;
+  } catch (e) {
+    console.error('取得用戶名稱失敗:', e.message);
+    return '未知成員';
+  }
+}
+
+async function recordLeave(event, userName, date, reason) {
+  const now = new Date();
+  const timestamp = formatTimestamp(now);
+  await appendToSheet(userName, date, reason, timestamp);
+  return client.replyMessage(event.replyToken, {
+    type: 'text',
+    text: `✅ 已登記請假\n👤 ${userName}\n📅 ${date}\n📝 ${reason === '未說明' ? '原因未說明' : reason}`,
+  });
+}
+
 async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return null;
 
   const text = event.message.text.trim();
   const senderId = event.source.userId;
 
-  // 課表器材提醒
+  // ===== 處理待確認的請假 =====
+  if (pendingConfirmations.has(senderId)) {
+    const pending = pendingConfirmations.get(senderId);
+    const reply = text.trim();
+
+    if (/^(是|對|好|確認|要|yes)$/i.test(reply)) {
+      pendingConfirmations.delete(senderId);
+      try {
+        return await recordLeave(event, pending.userName, pending.date, pending.reason);
+      } catch (e) {
+        console.error('處理失敗:', e.message);
+        return client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ 登記失敗，請管理員手動記錄。' });
+      }
+    }
+
+    if (/^(否|不|取消|不要|no)$/i.test(reply)) {
+      pendingConfirmations.delete(senderId);
+      return client.replyMessage(event.replyToken, { type: 'text', text: '已取消，不登記請假。' });
+    }
+
+    // 非是/否的回覆：清除等待狀態，繼續正常處理該訊息
+    pendingConfirmations.delete(senderId);
+  }
+
+  // ===== 課表器材提醒 =====
   if (isScheduleMessage(text)) {
     const equipment = detectEquipment(text);
     if (equipment.length > 0) {
@@ -152,37 +228,30 @@ async function handleEvent(event) {
     return null;
   }
 
-  if (!isLeaveMessage(text)) return null;
+  // ===== 請假意圖辨識 =====
+  const classification = classifyLeaveMessage(text);
+  if (classification === 'none') return null;
 
-  let userName = '未知成員';
-  try {
-    if (event.source.type === 'group') {
-      const profile = await client.getGroupMemberProfile(event.source.groupId, senderId);
-      userName = profile.displayName;
-    } else {
-      const profile = await client.getProfile(senderId);
-      userName = profile.displayName;
-    }
-  } catch (e) {
-    console.error('取得用戶名稱失敗:', e.message);
-  }
-
+  const userName = await getUserName(event);
   const date = extractDate(text);
   const reason = extractReason(text);
-  const now = new Date();
-  const timestamp = `${now.getFullYear()}/${now.getMonth() + 1}/${now.getDate()} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
 
-  try {
-    await appendToSheet(userName, date, reason, timestamp);
-    const replyMsg = `✅ 已登記請假\n👤 ${userName}\n📅 ${date}\n📝 ${reason === '未說明' ? '原因未說明' : reason}`;
-    return client.replyMessage(event.replyToken, { type: 'text', text: replyMsg });
-  } catch (e) {
-    console.error('處理失敗:', e.message);
-    return client.replyMessage(event.replyToken, {
-      type: 'text',
-      text: `⚠️ 登記失敗，請管理員手動記錄。`,
-    });
+  // 明確第一人稱 → 直接登記
+  if (classification === 'direct') {
+    try {
+      return await recordLeave(event, userName, date, reason);
+    } catch (e) {
+      console.error('處理失敗:', e.message);
+      return client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ 登記失敗，請管理員手動記錄。' });
+    }
   }
+
+  // 曖昧情況 → 請本人確認
+  pendingConfirmations.set(senderId, { userName, date, reason });
+  return client.replyMessage(event.replyToken, {
+    type: 'text',
+    text: `❓ 偵測到請假訊息\n👤 ${userName}，請問是你本人要請假嗎？\n📅 ${date}\n\n回覆「是」確認登記，回覆「否」取消。`,
+  });
 }
 
 // ===== 路由 =====
