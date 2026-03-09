@@ -15,6 +15,20 @@ const SHEET_NAME = process.env.SHEET_NAME || '請假紀錄';
 
 const client = new line.Client(config);
 
+// ===== 練習日 =====
+const PRACTICE_DAYS = new Set([2, 4, 6]); // 週二、四、六
+
+function isPracticeDay(dateStr) {
+  // dateStr 格式：YYYY/M/D
+  const d = new Date(dateStr);
+  return PRACTICE_DAYS.has(d.getDay());
+}
+
+function weekdayName(dateStr) {
+  const names = ['日', '一', '二', '三', '四', '五', '六'];
+  return names[new Date(dateStr).getDay()];
+}
+
 // ===== 課表器材偵測 =====
 function detectEquipment(text) {
   const equipment = [];
@@ -169,6 +183,36 @@ async function getSheetRows() {
     range: `${SHEET_NAME}!A:E`,
   });
   return res.data.values || [];
+}
+
+// 查某人本月請假紀錄
+async function getMyLeaves(userName) {
+  const rows = await getSheetRows();
+  const now = new Date();
+  const prefix = `${now.getFullYear()}/${now.getMonth() + 1}/`;
+  return rows.slice(1).filter(r => r[0] === userName && r[1] && r[1].startsWith(prefix) && r[4] !== '已取消');
+}
+
+// 查某天請假名單
+async function getLeavesOnDate(date) {
+  const rows = await getSheetRows();
+  return rows.slice(1).filter(r => r[1] === date && r[4] !== '已取消');
+}
+
+// 查本週（週二、四、六）請假名單
+async function getWeekLeaves() {
+  const rows = await getSheetRows();
+  const now = new Date();
+  const thisWeek = [];
+  // 找出本週的週二、四、六日期
+  for (const day of [2, 4, 6]) {
+    const d = new Date(now);
+    const diff = day - d.getDay();
+    d.setDate(d.getDate() + diff);
+    const dateStr = `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`;
+    thisWeek.push(dateStr);
+  }
+  return { dates: thisWeek, rows: rows.slice(1).filter(r => thisWeek.includes(r[1]) && r[4] !== '已取消') };
 }
 
 // 找到同名同日期且未取消的紀錄，回傳 { rowIndex（1-indexed）, row }
@@ -358,6 +402,13 @@ async function handleEvent(event) {
           text: '無法辨識日期，請重新輸入。\n（例如：3/15、3月15日、今天、明天）',
         });
       }
+      if (!isPracticeDay(parsedDate)) {
+        pendingConfirmations.delete(senderId);
+        return client.replyMessage(event.replyToken, {
+          type: 'text',
+          text: `${parsedDate}（週${weekdayName(parsedDate)}）沒有練習，不需要請假。\n練習日為每週二、四、六。`,
+        });
+      }
       pending.date = parsedDate;
       pending.step = nextStep(pending);
       if (pending.step === 'ready') return await checkAndRecord(event, senderId, pending);
@@ -431,6 +482,66 @@ async function handleEvent(event) {
     });
   }
 
+  // ===== 查詢功能 =====
+  if (/我的請假|我的紀錄/.test(text)) {
+    const userName = await getUserName(event);
+    let rows;
+    try { rows = await getMyLeaves(userName); } catch (e) { rows = []; }
+    if (rows.length === 0) {
+      return client.replyMessage(event.replyToken, { type: 'text', text: '本月沒有請假紀錄。' });
+    }
+    const now = new Date();
+    const lines = rows.map(r => `📅 ${r[1]}　📝 ${r[2] || '未說明'}`);
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: `📋 ${userName} 本月請假紀錄（${now.getMonth() + 1}月）\n\n${lines.join('\n')}`,
+    });
+  }
+
+  const dateQueryMatch = text.match(/(\d{1,2})\/(\d{1,2})\s*(?:的)?(?:請假名單|有誰請假|請假|名單)/);
+  if (dateQueryMatch) {
+    const now = new Date();
+    const date = `${now.getFullYear()}/${dateQueryMatch[1]}/${dateQueryMatch[2]}`;
+    if (!isPracticeDay(date)) {
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: `${date}（週${weekdayName(date)}）沒有練習。`,
+      });
+    }
+    let rows;
+    try { rows = await getLeavesOnDate(date); } catch (e) { rows = []; }
+    if (rows.length === 0) {
+      return client.replyMessage(event.replyToken, { type: 'text', text: `${date} 目前沒有請假紀錄。` });
+    }
+    const lines = rows.map(r => `👤 ${r[0]}　📝 ${r[2] || '未說明'}`);
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: `📋 ${date} 請假名單\n\n${lines.join('\n')}`,
+    });
+  }
+
+  if (/本週請假|這週請假|本週名單|這週名單/.test(text)) {
+    let result;
+    try { result = await getWeekLeaves(); } catch (e) { result = { dates: [], rows: [] }; }
+    if (result.rows.length === 0) {
+      return client.replyMessage(event.replyToken, { type: 'text', text: '本週目前沒有請假紀錄。' });
+    }
+    const grouped = {};
+    for (const date of result.dates) grouped[date] = [];
+    for (const r of result.rows) {
+      if (grouped[r[1]]) grouped[r[1]].push(r[0]);
+    }
+    const sections = result.dates.map(date => {
+      const names = grouped[date];
+      if (names.length === 0) return `📅 ${date}（週${weekdayName(date)}）：無請假`;
+      return `📅 ${date}（週${weekdayName(date)}）\n${names.map(n => `  👤 ${n}`).join('\n')}`;
+    });
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: `📋 本週請假名單\n\n${sections.join('\n\n')}`,
+    });
+  }
+
   // ===== 課表器材提醒 =====
   if (isScheduleMessage(text)) {
     const equipment = detectEquipment(text);
@@ -447,6 +558,14 @@ async function handleEvent(event) {
 
   const userName = await getUserName(event);
   const date = extractDate(text);
+
+  if (date !== '日期未指定' && !isPracticeDay(date)) {
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: `${date}（週${weekdayName(date)}）沒有練習，不需要請假。\n練習日為每週二、四、六。`,
+    });
+  }
+
   const reason = extractReason(text);
 
   const pending = {
