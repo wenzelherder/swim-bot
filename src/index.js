@@ -33,7 +33,6 @@ function detectEquipment(text) {
 }
 
 function isScheduleMessage(text) {
-  // 課表通常包含距離、組數、時間等關鍵字
   return (
     /\d+m\s*x\d+/i.test(text) ||
     /T-\d+:\d+/.test(text) ||
@@ -49,9 +48,17 @@ const LEAVE_KEYWORDS = [
   '今天不來', '明天不來', '這週不來', '下週不來',
 ];
 
+// ===== 取消請假關鍵字 =====
+const CANCEL_KEYWORDS = ['取消請假', '取消假', '不請假了', '我不請假了', '取消掉請假'];
+
+function isCancelMessage(text) {
+  return CANCEL_KEYWORDS.some(kw => text.includes(kw));
+}
+
 // 待處理的請假流程（key: userId）
-// value: { userName, date, reason, needsConfirm, step }
-// step: 'awaiting_date' | 'awaiting_reason' | 'awaiting_confirm'
+// type: 'leave' | 'cancel'
+// leave steps: 'awaiting_date' | 'awaiting_reason' | 'awaiting_confirm' | 'awaiting_overwrite_confirm'
+// cancel steps: 'cancel_awaiting_date' | 'cancel_awaiting_confirm'
 const pendingConfirmations = new Map();
 
 function nextStep(pending) {
@@ -74,11 +81,12 @@ function buildStepMessage(pending) {
 
 /**
  * 回傳：
- *  'none'    - 不是請假（疑問句 or 說別人）
+ *  'none'    - 不是請假（疑問句 or 說別人 or 取消請假）
  *  'direct'  - 確定是本人請假（含「我」）
  *  'confirm' - 曖昧，需要二次確認
  */
 function classifyLeaveMessage(text) {
+  if (isCancelMessage(text)) return 'none';
   if (!LEAVE_KEYWORDS.some(kw => text.includes(kw))) return 'none';
 
   // 疑問句過濾：含嗎、呢、？ 或英文問號
@@ -87,13 +95,8 @@ function classifyLeaveMessage(text) {
   const hasFirstPerson = /我|本人/.test(text);
   const hasOtherPerson = /你|妳|他|她|誰|對方/.test(text);
 
-  // 在說別人且非自己
   if (hasOtherPerson && !hasFirstPerson) return 'none';
-
-  // 明確第一人稱
   if (hasFirstPerson) return 'direct';
-
-  // 沒有人稱代詞，曖昧情況
   return 'confirm';
 }
 
@@ -137,28 +140,74 @@ function extractReason(text) {
   return '未說明';
 }
 
-async function appendToSheet(name, date, reason, timestamp) {
-  const auth = new google.auth.GoogleAuth({
+// ===== Google Sheets 操作 =====
+async function getAuth() {
+  return new google.auth.GoogleAuth({
     credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
+}
+
+async function appendToSheet(name, date, reason, timestamp) {
+  const auth = await getAuth();
   const sheets = google.sheets({ version: 'v4', auth });
   await sheets.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${SHEET_NAME}!A:D`,
+    range: `${SHEET_NAME}!A:E`,
     valueInputOption: 'USER_ENTERED',
     requestBody: {
-      values: [[name, date, reason, timestamp]],
+      values: [[name, date, reason, timestamp, '']],
     },
+  });
+}
+
+async function getSheetRows() {
+  const auth = await getAuth();
+  const sheets = google.sheets({ version: 'v4', auth });
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${SHEET_NAME}!A:E`,
+  });
+  return res.data.values || [];
+}
+
+// 找到同名同日期且未取消的紀錄，回傳 { rowIndex（1-indexed）, row }
+async function findActiveRow(name, date) {
+  const rows = await getSheetRows();
+  for (let i = 1; i < rows.length; i++) {
+    const [rowName, rowDate, , , rowStatus] = rows[i];
+    if (rowName === name && rowDate === date && rowStatus !== '已取消') {
+      return { rowIndex: i + 1, row: rows[i] };
+    }
+  }
+  return null;
+}
+
+async function markRowCancelled(rowIndex) {
+  const auth = await getAuth();
+  const sheets = google.sheets({ version: 'v4', auth });
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${SHEET_NAME}!E${rowIndex}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [['已取消']] },
+  });
+}
+
+async function overwriteRow(rowIndex, name, date, reason, timestamp) {
+  const auth = await getAuth();
+  const sheets = google.sheets({ version: 'v4', auth });
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${SHEET_NAME}!A${rowIndex}:E${rowIndex}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [[name, date, reason, timestamp, '']] },
   });
 }
 
 async function ensureSheetHeader() {
   try {
-    const auth = new google.auth.GoogleAuth({
-      credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-    });
+    const auth = await getAuth();
     const sheets = google.sheets({ version: 'v4', auth });
     const res = await sheets.spreadsheets.values.get({
       spreadsheetId: SPREADSHEET_ID,
@@ -167,10 +216,10 @@ async function ensureSheetHeader() {
     if (!res.data.values || res.data.values.length === 0) {
       await sheets.spreadsheets.values.update({
         spreadsheetId: SPREADSHEET_ID,
-        range: `${SHEET_NAME}!A1:D1`,
+        range: `${SHEET_NAME}!A1:E1`,
         valueInputOption: 'USER_ENTERED',
         requestBody: {
-          values: [['姓名', '請假日期', '請假原因', '登記時間']],
+          values: [['姓名', '請假日期', '請假原因', '登記時間', '狀態']],
         },
       });
       console.log('已建立標題列');
@@ -208,22 +257,99 @@ async function recordLeave(event, userName, date, reason) {
   });
 }
 
+// 登記前先檢查重複；有重複則進入覆蓋確認流程
+async function checkAndRecord(event, senderId, pending) {
+  let found;
+  try {
+    found = await findActiveRow(pending.userName, pending.date);
+  } catch (e) {
+    console.error('查詢 Sheet 失敗:', e.message);
+    found = null;
+  }
+
+  if (found) {
+    const existingReason = found.row[2] || '未說明';
+    pending.step = 'awaiting_overwrite_confirm';
+    pending.existingRowIndex = found.rowIndex;
+    pendingConfirmations.set(senderId, pending);
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: `⚠️ 你已有 ${pending.date} 的請假紀錄（原因：${existingReason}）。\n要更新原因為「${pending.reason === '未說明' ? '未說明' : pending.reason}」嗎？\n\n回覆「是」更新，「否」保留原本。`,
+    });
+  }
+
+  pendingConfirmations.delete(senderId);
+  try { return await recordLeave(event, pending.userName, pending.date, pending.reason); }
+  catch (e) { return client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ 登記失敗，請管理員手動記錄。' }); }
+}
+
 async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return null;
 
   const text = event.message.text.trim();
   const senderId = event.source.userId;
 
-  // ===== 處理進行中的請假流程 =====
+  // ===== 處理進行中的流程 =====
   if (pendingConfirmations.has(senderId)) {
     const pending = pendingConfirmations.get(senderId);
 
-    // 任何步驟都可以取消
+    // 任何步驟都可以中止
     if (/^(否|不|取消|不要|no)$/i.test(text)) {
       pendingConfirmations.delete(senderId);
-      return client.replyMessage(event.replyToken, { type: 'text', text: '已取消，不登記請假。' });
+      const msg = pending.type === 'cancel' ? '好的，保留請假紀錄。' : '已取消，不登記請假。';
+      return client.replyMessage(event.replyToken, { type: 'text', text: msg });
     }
 
+    // ===== 取消請假流程 =====
+    if (pending.type === 'cancel') {
+      if (pending.step === 'cancel_awaiting_date') {
+        const date = extractDate(text);
+        if (date === '日期未指定') {
+          return client.replyMessage(event.replyToken, {
+            type: 'text',
+            text: '無法辨識日期，請重新輸入。\n（例如：3/15、3月15日、今天、明天）',
+          });
+        }
+        let found;
+        try { found = await findActiveRow(pending.userName, date); }
+        catch (e) { found = null; }
+
+        if (!found) {
+          pendingConfirmations.delete(senderId);
+          return client.replyMessage(event.replyToken, { type: 'text', text: `找不到你 ${date} 的請假紀錄。` });
+        }
+        const existingReason = found.row[2] || '未說明';
+        pending.date = date;
+        pending.rowIndex = found.rowIndex;
+        pending.step = 'cancel_awaiting_confirm';
+        pendingConfirmations.set(senderId, pending);
+        return client.replyMessage(event.replyToken, {
+          type: 'text',
+          text: `找到以下請假紀錄：\n👤 ${pending.userName}\n📅 ${date}\n📝 ${existingReason}\n\n確認取消嗎？回覆「是」確認，「否」保留。`,
+        });
+      }
+
+      if (pending.step === 'cancel_awaiting_confirm') {
+        if (/^(是|對|好|確認|要|yes)$/i.test(text)) {
+          pendingConfirmations.delete(senderId);
+          try {
+            await markRowCancelled(pending.rowIndex);
+            return client.replyMessage(event.replyToken, { type: 'text', text: `✅ 已取消 ${pending.date} 的請假紀錄。` });
+          } catch (e) {
+            return client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ 取消失敗，請管理員手動處理。' });
+          }
+        }
+        return client.replyMessage(event.replyToken, {
+          type: 'text',
+          text: `請回覆「是」確認取消，或「否」保留。\n\n找到以下請假紀錄：\n👤 ${pending.userName}\n📅 ${pending.date}`,
+        });
+      }
+
+      pendingConfirmations.delete(senderId);
+      return null;
+    }
+
+    // ===== 請假流程 =====
     if (pending.step === 'awaiting_date') {
       const parsedDate = extractDate(text);
       if (parsedDate === '日期未指定') {
@@ -234,11 +360,7 @@ async function handleEvent(event) {
       }
       pending.date = parsedDate;
       pending.step = nextStep(pending);
-      if (pending.step === 'ready') {
-        pendingConfirmations.delete(senderId);
-        try { return await recordLeave(event, pending.userName, pending.date, pending.reason); }
-        catch (e) { return client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ 登記失敗，請管理員手動記錄。' }); }
-      }
+      if (pending.step === 'ready') return await checkAndRecord(event, senderId, pending);
       pendingConfirmations.set(senderId, pending);
       return client.replyMessage(event.replyToken, { type: 'text', text: buildStepMessage(pending) });
     }
@@ -246,30 +368,67 @@ async function handleEvent(event) {
     if (pending.step === 'awaiting_reason') {
       pending.reason = /^略過$/.test(text) ? '未說明' : text;
       pending.step = nextStep(pending);
-      if (pending.step === 'ready') {
-        pendingConfirmations.delete(senderId);
-        try { return await recordLeave(event, pending.userName, pending.date, pending.reason); }
-        catch (e) { return client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ 登記失敗，請管理員手動記錄。' }); }
-      }
+      if (pending.step === 'ready') return await checkAndRecord(event, senderId, pending);
       pendingConfirmations.set(senderId, pending);
       return client.replyMessage(event.replyToken, { type: 'text', text: buildStepMessage(pending) });
     }
 
     if (pending.step === 'awaiting_confirm') {
       if (/^(是|對|好|確認|要|yes)$/i.test(text)) {
-        pendingConfirmations.delete(senderId);
-        try { return await recordLeave(event, pending.userName, pending.date, pending.reason); }
-        catch (e) { return client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ 登記失敗，請管理員手動記錄。' }); }
+        return await checkAndRecord(event, senderId, pending);
       }
-      // 非是/否，再次提示
       return client.replyMessage(event.replyToken, {
         type: 'text',
         text: `請回覆「是」確認登記，或「否」取消。\n\n${buildStepMessage(pending)}`,
       });
     }
 
+    if (pending.step === 'awaiting_overwrite_confirm') {
+      if (/^(是|對|好|確認|要|yes)$/i.test(text)) {
+        pendingConfirmations.delete(senderId);
+        try {
+          const now = new Date();
+          const timestamp = formatTimestamp(now);
+          await overwriteRow(pending.existingRowIndex, pending.userName, pending.date, pending.reason, timestamp);
+          return client.replyMessage(event.replyToken, {
+            type: 'text',
+            text: `✅ 已更新請假紀錄\n👤 ${pending.userName}\n📅 ${pending.date}\n📝 ${pending.reason === '未說明' ? '原因未說明' : pending.reason}`,
+          });
+        } catch (e) {
+          return client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ 更新失敗，請管理員手動處理。' });
+        }
+      }
+      pendingConfirmations.delete(senderId);
+      return client.replyMessage(event.replyToken, { type: 'text', text: '好的，保留原本的請假紀錄。' });
+    }
+
     // 未知狀態，清除
     pendingConfirmations.delete(senderId);
+  }
+
+  // ===== 取消請假意圖 =====
+  if (isCancelMessage(text)) {
+    const userName = await getUserName(event);
+    const date = extractDate(text);
+
+    if (date === '日期未指定') {
+      pendingConfirmations.set(senderId, { type: 'cancel', userName, date: null, step: 'cancel_awaiting_date' });
+      return client.replyMessage(event.replyToken, { type: 'text', text: '📅 請問要取消哪一天的請假？' });
+    }
+
+    let found;
+    try { found = await findActiveRow(userName, date); }
+    catch (e) { found = null; }
+
+    if (!found) {
+      return client.replyMessage(event.replyToken, { type: 'text', text: `找不到你 ${date} 的請假紀錄。` });
+    }
+    const existingReason = found.row[2] || '未說明';
+    pendingConfirmations.set(senderId, { type: 'cancel', userName, date, rowIndex: found.rowIndex, step: 'cancel_awaiting_confirm' });
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: `找到以下請假紀錄：\n👤 ${userName}\n📅 ${date}\n📝 ${existingReason}\n\n確認取消嗎？回覆「是」確認，「否」保留。`,
+    });
   }
 
   // ===== 課表器材提醒 =====
@@ -291,6 +450,7 @@ async function handleEvent(event) {
   const reason = extractReason(text);
 
   const pending = {
+    type: 'leave',
     userName,
     date: date !== '日期未指定' ? date : null,
     reason: reason !== '未說明' ? reason : null,
@@ -298,17 +458,10 @@ async function handleEvent(event) {
   };
   pending.step = nextStep(pending);
 
-  // 資料齊全且不需確認 → 直接登記
   if (pending.step === 'ready') {
-    try {
-      return await recordLeave(event, userName, date, reason);
-    } catch (e) {
-      console.error('處理失敗:', e.message);
-      return client.replyMessage(event.replyToken, { type: 'text', text: '⚠️ 登記失敗，請管理員手動記錄。' });
-    }
+    return await checkAndRecord(event, senderId, pending);
   }
 
-  // 缺資料或需確認 → 進入多步驟流程
   pendingConfirmations.set(senderId, pending);
   const intro = classification === 'confirm'
     ? `❓ 偵測到請假訊息，${userName} 請確認以下資訊：\n`
